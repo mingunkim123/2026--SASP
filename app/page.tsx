@@ -16,11 +16,20 @@ import {
   resampleAudio,
   reverseAudio,
 } from './dsp';
-import { FeaturePlot, SpectrogramPlot, WaveformPlot } from './plots';
+import {
+  AdvancedAnalysisResult,
+  analyzeAdvancedSpeech,
+  butterworthFilter,
+  noiseGate,
+  speechBandFilter,
+} from './advanced-dsp';
+import { FeaturePlot, FormantPlot, MfccMode, MfccPlot, PitchContourPlot, PlotView, SpectrogramPlot, WaveformPlot } from './plots';
 
 const TARGET_RATES = [48000, 16000, 8000, 2000] as const;
 type TargetRate = (typeof TARGET_RATES)[number];
 type PlotMode = 'waveform' | 'spectrogram' | 'features';
+type AdvancedMode = 'voice' | 'formants' | 'mfcc';
+type FilterMode = 'highpass' | 'lowpass' | 'bandpass';
 type SectionId = 'workspace' | 'record' | 'analysis' | 'segments' | 'export';
 
 type AudioAsset = {
@@ -31,7 +40,24 @@ type AudioAsset = {
   sourceChannels: number;
 };
 
+type SegmentationThresholds = { energyMarginDb: number; voicingPeriodicity: number };
+type ProcessingSnapshot = {
+  asset: AudioAsset;
+  segments: Segment[];
+  segmentsEdited: boolean;
+  processingSteps: string[];
+  thresholds: SegmentationThresholds;
+};
+
+type BuildOptions = {
+  generation?: number;
+  preservedSegments?: Segment[];
+  segmentsEdited?: boolean;
+  thresholds?: SegmentationThresholds;
+};
+
 const ASSIGNMENT_TEXT = 'Speech has evolved as a primary form of communication between humans. The topic of this class, “discrete-time speech signal processing” can be defined as the manipulation of sampled speech signals by a digital processor to obtain a new signal with some desired properties.';
+const MAX_DURATION_SECONDS = 120;
 
 const RATE_NOTES: Record<TargetRate, { title: string; note: string }> = {
   48000: { title: 'Studio reference', note: 'Full reference bandwidth up to 24 kHz.' },
@@ -50,10 +76,15 @@ const NAV_ITEMS: { id: SectionId; icon: string; label: string }[] = [
 
 const prettyBytes = (bytes: number) => bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 const stem = (name: string) => name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9가-힣_-]+/gi, '-');
+const metric = (value: number | null, unit: string, digits = 1) => value === null ? 'Not reliable' : `${value.toFixed(digits)} ${unit}`;
 
-function DownloadAction({ prepare, className, children, stopPropagation = false }: { prepare: () => { blob: Blob; filename: string } | null; className?: string; children: ReactNode; stopPropagation?: boolean }) {
+function DownloadAction({ prepare, className, children, stopPropagation = false, disabled = false }: { prepare: () => { blob: Blob; filename: string } | null; className?: string; children: ReactNode; stopPropagation?: boolean; disabled?: boolean }) {
   function handleClick(event: ReactMouseEvent<HTMLAnchorElement>) {
     if (stopPropagation) event.stopPropagation();
+    if (disabled) {
+      event.preventDefault();
+      return;
+    }
     const download = prepare();
     if (!download) {
       event.preventDefault();
@@ -69,18 +100,25 @@ function DownloadAction({ prepare, className, children, stopPropagation = false 
     window.setTimeout(() => URL.revokeObjectURL(url), 30000);
   }
 
-  return <a href="#export" className={className} download onClick={handleClick}>{children}</a>;
+  const classes = [className, disabled ? 'disabled' : ''].filter(Boolean).join(' ');
+  return <a href="#export" className={classes || undefined} download aria-disabled={disabled || undefined} tabIndex={disabled ? -1 : undefined} onClick={handleClick}>{children}</a>;
 }
 
 export default function Home() {
   const [asset, setAsset] = useState<AudioAsset | null>(null);
   const [versions, setVersions] = useState<Map<TargetRate, Float32Array>>(new Map());
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+  const [advancedAnalysis, setAdvancedAnalysis] = useState<AdvancedAnalysisResult | null>(null);
   const [segments, setSegments] = useState<Segment[]>([]);
   const [selectedRate, setSelectedRate] = useState<TargetRate>(48000);
   const [plotMode, setPlotMode] = useState<PlotMode>('waveform');
+  const [advancedMode, setAdvancedMode] = useState<AdvancedMode>('voice');
+  const [mfccMode, setMfccMode] = useState<MfccMode>('coefficients');
+  const [plotView, setPlotView] = useState<PlotView>({ start: 0, end: 1 });
   const [energyMargin, setEnergyMargin] = useState(9);
   const [voicingThreshold, setVoicingThreshold] = useState(0.42);
+  const [appliedThresholds, setAppliedThresholds] = useState<SegmentationThresholds>({ energyMarginDb: 9, voicingPeriodicity: .42 });
+  const [segmentsEdited, setSegmentsEdited] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
@@ -88,18 +126,29 @@ export default function Home() {
   const [playingRate, setPlayingRate] = useState<TargetRate | null>(null);
   const [status, setStatus] = useState('Ready for a 48 kHz mono recording');
   const [showHelp, setShowHelp] = useState(false);
-  const [history, setHistory] = useState<AudioAsset[]>([]);
+  const [history, setHistory] = useState<ProcessingSnapshot[]>([]);
   const [activeSection, setActiveSection] = useState<SectionId>('workspace');
   const [microphoneSupported, setMicrophoneSupported] = useState<boolean | null>(null);
+  const [filterMode, setFilterMode] = useState<FilterMode>('bandpass');
+  const [lowCutoff, setLowCutoff] = useState('80');
+  const [highCutoff, setHighCutoff] = useState('8000');
+  const [gateThreshold, setGateThreshold] = useState(-45);
+  const [processingSteps, setProcessingSteps] = useState<string[]>([]);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const monitorContextRef = useRef<AudioContext | null>(null);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const liveAnimationRef = useRef<number | null>(null);
   const playbackRef = useRef<{ context: AudioContext; source: AudioBufferSourceNode } | null>(null);
   const manualNavigationUntilRef = useRef(0);
+  const processingGenerationRef = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const activeSamples = versions.get(selectedRate) ?? null;
   const duration = asset ? asset.samples.length / asset.sampleRate : 0;
+  const controlsLocked = isBusy || isRecording;
+  const segmentationSettingsPending = energyMargin !== appliedThresholds.energyMarginDb || voicingThreshold !== appliedThresholds.voicingPeriodicity;
   const classDurations = useMemo(() => {
     const totals: Record<SegmentClass, number> = { 0: 0, 1: 0, 2: 0 };
     for (const segment of segments) totals[segment.classId] += Math.max(0, segment.end - segment.start);
@@ -109,6 +158,16 @@ export default function Home() {
   useEffect(() => () => {
     if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
     if (liveAnimationRef.current) cancelAnimationFrame(liveAnimationRef.current);
+    const recorder = recorderRef.current;
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      if (recorder.state !== 'inactive') {
+        try { recorder.stop(); } catch { /* recorder already stopped */ }
+      }
+    }
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    void monitorContextRef.current?.close();
     playbackRef.current?.source.stop();
     playbackRef.current?.context.close();
   }, []);
@@ -136,54 +195,94 @@ export default function Home() {
     return () => window.removeEventListener('scroll', updateActiveSection);
   }, [asset]);
 
-  async function buildAsset(nextAsset: AudioAsset, message = 'Analysis complete') {
+  async function buildAsset(nextAsset: AudioAsset, message = 'Analysis complete', options: BuildOptions = {}) {
+    const generation = options.generation ?? ++processingGenerationRef.current;
+    if (generation !== processingGenerationRef.current) return false;
+    const thresholds = options.thresholds ?? { energyMarginDb: energyMargin, voicingPeriodicity: voicingThreshold };
     setIsBusy(true);
     setStatus('Resampling and extracting speech features…');
     try {
       const reference = await resampleAudio(nextAsset.samples, nextAsset.sampleRate, 48000);
+      if (generation !== processingGenerationRef.current) return false;
       const [wideband, telephone] = await Promise.all([
         resampleAudio(reference, 48000, 16000),
         resampleAudio(reference, 48000, 8000),
       ]);
+      if (generation !== processingGenerationRef.current) return false;
       const narrowband = await resampleAudio(telephone, 8000, 2000);
+      if (generation !== processingGenerationRef.current) return false;
       const nextVersions = new Map<TargetRate, Float32Array>([
         [48000, reference],
         [16000, wideband],
         [8000, telephone],
         [2000, narrowband],
       ]);
-      const nextAnalysis = analyzeSpeech(nextVersions.get(48000)!, 48000, energyMargin, voicingThreshold);
+      const nextAnalysis = analyzeSpeech(nextVersions.get(48000)!, 48000, thresholds.energyMarginDb, thresholds.voicingPeriodicity);
+      setStatus('Extracting F0, voice quality, LPC formants, and MFCC…');
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      if (generation !== processingGenerationRef.current) return false;
+      const nextAdvancedAnalysis = analyzeAdvancedSpeech(wideband, 16000, reference, 48000);
+      if (generation !== processingGenerationRef.current) return false;
       setAsset({ ...nextAsset, samples: nextVersions.get(48000)!, sampleRate: 48000 });
       setVersions(nextVersions);
       setAnalysis(nextAnalysis);
-      setSegments(nextAnalysis.segments);
+      setAdvancedAnalysis(nextAdvancedAnalysis);
+      setSegments(options.preservedSegments?.map((segment) => ({ ...segment })) ?? nextAnalysis.segments);
+      setSegmentsEdited(options.preservedSegments ? Boolean(options.segmentsEdited) : false);
+      setAppliedThresholds(thresholds);
       setSelectedRate(48000);
+      setPlotView({ start: 0, end: 1 });
       setStatus(message);
+      return true;
     } catch (error) {
-      console.error(error);
-      setStatus('Could not process this audio. Try WAV, MP3, M4A, OGG, or WebM.');
+      if (generation === processingGenerationRef.current) {
+        console.error(error);
+        setStatus('Could not process this audio. Try WAV, MP3, M4A, OGG, or WebM.');
+      }
+      return false;
     } finally {
-      setIsBusy(false);
+      if (generation === processingGenerationRef.current) setIsBusy(false);
     }
   }
 
-  async function decodeBlob(blob: Blob, name: string) {
+  async function decodeBlob(blob: Blob, name: string, trimRecordingToLimit = false) {
+    const generation = ++processingGenerationRef.current;
+    stopPlayback();
     setIsBusy(true);
     setStatus('Decoding audio…');
     let context: AudioContext | null = null;
     try {
       context = new AudioContext({ sampleRate: 48000 });
       const decoded = await context.decodeAudioData(await blob.arrayBuffer());
+      if (generation !== processingGenerationRef.current) return;
+      if (decoded.duration > MAX_DURATION_SECONDS && !trimRecordingToLimit) {
+        setStatus(`Please use audio up to ${MAX_DURATION_SECONDS / 60} minutes so frame analysis stays responsive.`);
+        setIsBusy(false);
+        return;
+      }
       const sourceRate = decoded.sampleRate;
       const sourceChannels = decoded.numberOfChannels;
-      const mono = mixToMono(decoded);
+      const decodedMono = mixToMono(decoded);
+      const maximumSourceSamples = Math.floor(sourceRate * MAX_DURATION_SECONDS);
+      const mono = trimRecordingToLimit && decodedMono.length > maximumSourceSamples
+        ? decodedMono.slice(0, maximumSourceSamples)
+        : decodedMono;
       const at48k = await resampleAudio(mono, sourceRate, 48000);
-      await buildAsset({ name, samples: at48k, sampleRate: 48000, sourceRate, sourceChannels }, 'Loaded, standardized to 48 kHz mono, and segmented');
-      setHistory([]);
+      if (generation !== processingGenerationRef.current) return;
+      const message = trimRecordingToLimit && decoded.duration > MAX_DURATION_SECONDS
+        ? `Recording capped at ${MAX_DURATION_SECONDS / 60} minutes, standardized, and segmented`
+        : 'Loaded, standardized to 48 kHz mono, and segmented';
+      const committed = await buildAsset({ name, samples: at48k, sampleRate: 48000, sourceRate, sourceChannels }, message, { generation });
+      if (committed) {
+        setHistory([]);
+        setProcessingSteps([]);
+      }
     } catch (error) {
-      console.error(error);
-      setStatus('Audio decoding failed. Try a different file format.');
-      setIsBusy(false);
+      if (generation === processingGenerationRef.current) {
+        console.error(error);
+        setStatus('Audio decoding failed. Try a different file format.');
+        setIsBusy(false);
+      }
     } finally {
       await context?.close();
     }
@@ -191,6 +290,14 @@ export default function Home() {
 
   function handleFile(file?: File) {
     if (!file) return;
+    if (isRecording) {
+      setStatus('Stop the current recording before loading another file.');
+      return;
+    }
+    if (isBusy) {
+      setStatus('Please wait for the current analysis to finish before loading another file.');
+      return;
+    }
     if (!file.type.startsWith('audio/') && !/\.(wav|mp3|m4a|aac|ogg|webm|flac)$/i.test(file.name)) {
       setStatus('Please choose an audio file.');
       return;
@@ -208,39 +315,95 @@ export default function Home() {
     handleFile(event.dataTransfer.files?.[0]);
   }
 
+  function cancelRecording() {
+    if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+    recordingTimerRef.current = null;
+    if (liveAnimationRef.current) cancelAnimationFrame(liveAnimationRef.current);
+    liveAnimationRef.current = null;
+
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      if (recorder.state !== 'inactive') {
+        try { recorder.stop(); } catch { /* recorder already stopped */ }
+      }
+    }
+    const stream = recordingStreamRef.current ?? recorder?.stream ?? null;
+    recordingStreamRef.current = null;
+    stream?.getTracks().forEach((track) => track.stop());
+    const monitor = monitorContextRef.current;
+    monitorContextRef.current = null;
+    if (monitor) void monitor.close().catch(() => undefined);
+    setIsRecording(false);
+    setRecordingSeconds(0);
+    setLiveLevel(0);
+  }
+
   async function startRecording() {
+    if (isBusy || isRecording) return;
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
       setStatus('Microphone recording is not supported in this browser.');
       return;
     }
+    stopPlayback();
+    setIsBusy(true);
+    setStatus('Requesting microphone access…');
+    let stream: MediaStream | null = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, sampleRate: 48000, sampleSize: 16, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
       });
+      const activeStream = stream;
+      recordingStreamRef.current = activeStream;
       const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].find((type) => MediaRecorder.isTypeSupported(type));
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      const chunks: Blob[] = [];
-      recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
-      recorder.onstop = () => {
-        stream.getTracks().forEach((track) => track.stop());
-        const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
-        void decodeBlob(blob, `speech-recording-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.webm`);
-      };
+      const recorder = new MediaRecorder(activeStream, mimeType ? { mimeType } : undefined);
       recorderRef.current = recorder;
-      recorder.start(250);
-      setIsRecording(true);
-      setRecordingSeconds(0);
-      setStatus('Recording in mono — read the passage at a natural pace');
-      const startedAt = performance.now();
-      recordingTimerRef.current = setInterval(() => setRecordingSeconds((performance.now() - startedAt) / 1000), 100);
-
+      const chunks: Blob[] = [];
       const monitor = new AudioContext({ sampleRate: 48000 });
-      const source = monitor.createMediaStreamSource(stream);
+      monitorContextRef.current = monitor;
+      const source = monitor.createMediaStreamSource(activeStream);
       const analyser = monitor.createAnalyser();
       analyser.fftSize = 1024;
       source.connect(analyser);
       const buffer = new Float32Array(analyser.fftSize);
+
+      recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+      recorder.onstop = () => {
+        activeStream.getTracks().forEach((track) => track.stop());
+        if (recordingStreamRef.current === activeStream) recordingStreamRef.current = null;
+        if (recorderRef.current === recorder) recorderRef.current = null;
+        if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+        if (liveAnimationRef.current) cancelAnimationFrame(liveAnimationRef.current);
+        liveAnimationRef.current = null;
+        if (monitorContextRef.current === monitor) monitorContextRef.current = null;
+        void monitor.close().catch(() => undefined);
+        setIsRecording(false);
+        setLiveLevel(0);
+        const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+        if (blob.size) {
+          void decodeBlob(blob, `speech-recording-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.webm`, true);
+        } else {
+          setIsBusy(false);
+          setStatus('No audio was captured. Please try recording again.');
+        }
+      };
+      recorder.start(250);
+      setIsBusy(false);
+      setIsRecording(true);
+      setRecordingSeconds(0);
+      setStatus('Recording in mono — read the passage at a natural pace');
+      const startedAt = performance.now();
+      recordingTimerRef.current = setInterval(() => {
+        const elapsed = (performance.now() - startedAt) / 1000;
+        setRecordingSeconds(Math.min(elapsed, MAX_DURATION_SECONDS));
+        if (elapsed >= MAX_DURATION_SECONDS) stopRecording(`Reached the ${MAX_DURATION_SECONDS / 60}-minute limit — finalizing the recording…`);
+      }, 100);
+
       const tick = () => {
+        if (recorder.state !== 'recording') return;
         analyser.getFloatTimeDomainData(buffer);
         let square = 0;
         for (const value of buffer) square += value * value;
@@ -248,23 +411,23 @@ export default function Home() {
         liveAnimationRef.current = requestAnimationFrame(tick);
       };
       tick();
-      recorder.addEventListener('stop', () => {
-        if (liveAnimationRef.current) cancelAnimationFrame(liveAnimationRef.current);
-        void monitor.close();
-        setLiveLevel(0);
-      });
     } catch (error) {
+      cancelRecording();
       console.error(error);
+      setIsBusy(false);
       setStatus('Microphone access was unavailable. Check browser permission or upload a file.');
     }
   }
 
-  function stopRecording() {
-    if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
+  function stopRecording(message = 'Finalizing the recording…') {
+    if (recorderRef.current?.state === 'recording') {
+      setIsBusy(true);
+      recorderRef.current.stop();
+    }
     if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
     recordingTimerRef.current = null;
     setIsRecording(false);
-    setStatus('Finalizing the recording…');
+    setStatus(message);
   }
 
   function stopPlayback() {
@@ -275,6 +438,7 @@ export default function Home() {
   }
 
   async function play(rate: TargetRate) {
+    if (isBusy || isRecording) return;
     if (playingRate === rate) { stopPlayback(); return; }
     stopPlayback();
     const samples = versions.get(rate);
@@ -310,67 +474,148 @@ export default function Home() {
 
   function rerunSegmentation() {
     const reference = versions.get(48000);
-    if (!reference) return;
+    if (!reference || isBusy || isRecording) return;
+    if (segmentsEdited && !window.confirm('Running automatic segmentation will replace your manual segment edits. Continue?')) return;
+    const generation = ++processingGenerationRef.current;
     setIsBusy(true);
     setStatus('Updating automatic segmentation…');
     window.setTimeout(() => {
+      if (generation !== processingGenerationRef.current) return;
       const result = analyzeSpeech(reference, 48000, energyMargin, voicingThreshold);
+      if (generation !== processingGenerationRef.current) return;
       setAnalysis(result);
       setSegments(result.segments);
+      setSegmentsEdited(false);
+      setAppliedThresholds({ energyMarginDb: energyMargin, voicingPeriodicity: voicingThreshold });
       setStatus(`Automatic segmentation updated: ${result.segments.length} regions`);
       setIsBusy(false);
     }, 0);
   }
 
-  async function applyProcessing(label: string, operation: (samples: Float32Array) => Float32Array) {
-    if (!asset) return;
-    setHistory((current) => [...current, asset]);
+  async function applyProcessing(label: string, operation: (samples: Float32Array) => Float32Array, transformSegments?: (items: Segment[]) => Segment[]) {
+    if (!asset || isBusy || isRecording) return;
+    const generation = ++processingGenerationRef.current;
+    stopPlayback();
+    const segmentSnapshot = segments.map((segment) => ({ ...segment }));
+    const historyEntry: ProcessingSnapshot = {
+      asset,
+      segments: segmentSnapshot,
+      segmentsEdited,
+      processingSteps: [...processingSteps],
+      thresholds: appliedThresholds,
+    };
     const processed = operation(asset.samples);
-    await buildAsset({ ...asset, name: `${stem(asset.name)}-${label}.wav`, samples: processed, sourceRate: 48000, sourceChannels: 1 }, `${label} applied`);
+    const preservedSegments = segmentsEdited ? (transformSegments ? transformSegments(segmentSnapshot) : segmentSnapshot) : undefined;
+    const committed = await buildAsset(
+      { ...asset, name: `${stem(asset.name)}-${label}.wav`, samples: processed, sourceRate: 48000, sourceChannels: 1 },
+      `${label} applied${preservedSegments ? ' · manual segment edits preserved' : ''}`,
+      { generation, preservedSegments, segmentsEdited, thresholds: appliedThresholds },
+    );
+    if (committed) {
+      setHistory((current) => [...current, historyEntry].slice(-4));
+      setProcessingSteps([...processingSteps, label]);
+    }
   }
 
   async function undoProcessing() {
     const previous = history.at(-1);
-    if (!previous) return;
-    setHistory((current) => current.slice(0, -1));
-    await buildAsset(previous, 'Last processing step undone');
+    if (!previous || isBusy || isRecording) return;
+    const generation = ++processingGenerationRef.current;
+    stopPlayback();
+    const committed = await buildAsset(previous.asset, 'Last processing step undone', {
+      generation,
+      preservedSegments: previous.segments,
+      segmentsEdited: previous.segmentsEdited,
+      thresholds: previous.thresholds,
+    });
+    if (committed) {
+      setHistory((current) => current.slice(0, -1));
+      setProcessingSteps(previous.processingSteps);
+      setEnergyMargin(previous.thresholds.energyMarginDb);
+      setVoicingThreshold(previous.thresholds.voicingPeriodicity);
+    }
+  }
+
+  function applySelectedFilter() {
+    if (isBusy || isRecording) return;
+    const parsedLowCutoff = Number(lowCutoff);
+    const parsedHighCutoff = Number(highCutoff);
+    const lowInvalid = filterMode !== 'lowpass' && (!Number.isFinite(parsedLowCutoff) || parsedLowCutoff < 20 || parsedLowCutoff > 5000);
+    const highInvalid = filterMode !== 'highpass' && (!Number.isFinite(parsedHighCutoff) || parsedHighCutoff < 200 || parsedHighCutoff > 22000);
+    if (lowInvalid || highInvalid) {
+      setStatus('Enter filter cutoffs within the displayed valid ranges.');
+      return;
+    }
+    if (filterMode === 'bandpass' && parsedLowCutoff >= parsedHighCutoff) {
+      setStatus('Band-pass requires the low cutoff to be below the high cutoff.');
+      return;
+    }
+    const label = filterMode === 'highpass'
+      ? `highpass-${parsedLowCutoff}hz`
+      : filterMode === 'lowpass'
+        ? `lowpass-${parsedHighCutoff}hz`
+        : `bandpass-${parsedLowCutoff}-${parsedHighCutoff}hz`;
+    const operation = filterMode === 'highpass'
+      ? (samples: Float32Array) => butterworthFilter(samples, 48000, parsedLowCutoff, 'highpass')
+      : filterMode === 'lowpass'
+        ? (samples: Float32Array) => butterworthFilter(samples, 48000, parsedHighCutoff, 'lowpass')
+        : (samples: Float32Array) => speechBandFilter(samples, 48000, parsedLowCutoff, parsedHighCutoff);
+    void applyProcessing(label, operation);
   }
 
   function updateSegment(id: string, field: 'start' | 'end' | 'classId', value: number) {
-    setSegments((current) => current.map((segment) => segment.id === id ? {
-      ...segment,
-      [field]: field === 'classId' ? value as SegmentClass : Math.max(0, Math.min(duration, value)),
-      confidence: field === 'classId' ? 1 : segment.confidence,
-    } : segment).sort((a, b) => a.start - b.start));
+    if (!Number.isFinite(value)) return;
+    setSegmentsEdited(true);
+    setSegments((current) => current.map((segment) => {
+      if (segment.id !== id) return segment;
+      if (field === 'classId') return { ...segment, classId: value as SegmentClass, confidence: 1 };
+      const boundary = Math.max(0, Math.min(duration, value));
+      return field === 'start'
+        ? { ...segment, start: Math.min(boundary, segment.end) }
+        : { ...segment, end: Math.max(boundary, segment.start) };
+    }).sort((a, b) => a.start - b.start));
   }
 
   function addSegment() {
     const lastEnd = segments.at(-1)?.end ?? 0;
+    setSegmentsEdited(true);
     setSegments((current) => [...current, { id: `manual-${Date.now()}`, start: lastEnd, end: Math.min(duration, lastEnd + .1), classId: 0, confidence: 1 }]);
   }
 
   function prepareSegmentExport(format: 'csv' | 'json' | 'txt') {
-    if (!asset || !analysis) return null;
+    if (!asset || !analysis || isBusy || isRecording) return null;
     const basename = stem(asset.name);
     if (format === 'csv') {
       const body = ['start_sec,end_sec,class_id,class_label,confidence', ...segments.map((segment) => `${segment.start.toFixed(4)},${segment.end.toFixed(4)},${segment.classId},${CLASS_META[segment.classId].label},${segment.confidence.toFixed(3)}`)].join('\n');
       return { blob: new Blob([body], { type: 'text/csv;charset=utf-8' }), filename: `${basename}-segments.csv` };
     } else if (format === 'json') {
-      return { blob: new Blob([JSON.stringify({ source: asset.name, sampleRate: 48000, channels: 1, thresholds: { energyMarginDb: energyMargin, voicingPeriodicity: voicingThreshold }, metrics: analysis, segments }, null, 2)], { type: 'application/json' }), filename: `${basename}-analysis.json` };
+      return { blob: new Blob([JSON.stringify({ schemaVersion: 2, source: asset.name, sampleRate: 48000, channels: 1, thresholds: appliedThresholds, processingSteps, segmentsManuallyEdited: segmentsEdited, metrics: { ...analysis, segments: undefined }, advancedAnalysis, segments }, null, 2)], { type: 'application/json' }), filename: `${basename}-analysis.json` };
     } else {
       const rows = segments.map((segment) => `${segment.start.toFixed(3)} ~ ${segment.end.toFixed(3)} sec: ${CLASS_META[segment.classId].label} (${segment.classId})`).join('\n');
-      const report = `SASP LAB — Speech Signal Analysis Report\n\nInput: ${asset.name}\nStandardized format: 48 kHz, mono\nDuration: ${duration.toFixed(3)} sec\nPeak: ${analysis.peakDbfs.toFixed(2)} dBFS\nRMS: ${analysis.meanRmsDb.toFixed(2)} dBFS\nMedian voiced pitch: ${analysis.estimatedPitchHz?.toFixed(1) ?? 'N/A'} Hz\nSpectral centroid: ${analysis.spectralCentroidHz.toFixed(1)} Hz\n\nSEGMENTATION\n${rows}\n\nAUTOMATIC SEGMENTATION METHOD\n25 ms frames and 10 ms hops are analyzed for RMS energy, zero-crossing rate, and normalized autocorrelation. A robust noise floor (20th percentile) creates an adaptive speech threshold. Frames below it are background (0); energetic, periodic frames with plausible pitch are voiced (2); remaining speech frames are unvoiced (1). A two-pass local vote suppresses isolated label flips. Thresholds remain visible and adjustable, and every result can be manually corrected before export.\n\nLIMITATIONS\nThis signal-processing baseline is explainable rather than phoneme-aware. Music, reverberation, clipping, overlapping speakers, and non-stationary noise can reduce accuracy. Confirm boundaries by listening and inspecting the spectrogram.`;
+      const quality = advancedAnalysis?.voiceQuality;
+      const formants = advancedAnalysis?.formantMediansHz;
+      const report = `SASP LAB — Speech Signal Analysis Report\n\nInput: ${asset.name}\nStandardized format: 48 kHz, mono\nDuration: ${duration.toFixed(3)} sec\nPeak: ${analysis.peakDbfs.toFixed(2)} dBFS\nRMS: ${analysis.meanRmsDb.toFixed(2)} dBFS\nSpectral centroid: ${analysis.spectralCentroidHz.toFixed(1)} Hz\nProcessing: ${processingSteps.length ? processingSteps.join(' → ') : 'None'}\n\nADVANCED SPEECH ANALYSIS\nF0/HNR/formant/MFCC reference: 16 kHz wideband\nJitter/shimmer cycle marks: 48 kHz source\nMedian F0: ${quality?.medianF0Hz?.toFixed(1) ?? 'N/A'} Hz\nF0 range: ${quality?.minF0Hz?.toFixed(1) ?? 'N/A'}–${quality?.maxF0Hz?.toFixed(1) ?? 'N/A'} Hz\nLocal jitter: ${quality?.jitterLocalPercent?.toFixed(3) ?? 'N/A'} %\nLocal shimmer: ${quality?.shimmerLocalPercent?.toFixed(3) ?? 'N/A'} %\nMedian HNR: ${quality?.hnrDb?.toFixed(1) ?? 'N/A'} dB\nLPC formants (F1/F2/F3): ${formants?.map((value) => value?.toFixed(0) ?? 'N/A').join(' / ') ?? 'N/A'} Hz\nMFCC: 13 static coefficients with Δ and Δ², ${advancedAnalysis?.mfccFrames.length ?? 0} stored frames\n\nSEGMENTATION\nApplied energy margin: ${appliedThresholds.energyMarginDb.toFixed(1)} dB\nApplied voicing periodicity: ${appliedThresholds.voicingPeriodicity.toFixed(2)}\nManual edits: ${segmentsEdited ? 'Yes (preserved)' : 'No'}\n${rows}\n\nAUTOMATIC SEGMENTATION METHOD\n25 ms frames and 10 ms hops are analyzed for RMS energy, zero-crossing rate, and normalized autocorrelation. A robust noise floor (20th percentile) creates an adaptive speech threshold. Frames below it are background (0); energetic, periodic frames with plausible pitch are voiced (2); remaining speech frames are unvoiced (1). A two-pass local vote suppresses isolated label flips. Thresholds remain visible and adjustable, and every result can be manually corrected before export.\n\nADVANCED METHOD\nF0 uses the first reliable YIN cumulative-mean-normalized-difference minimum and normalized autocorrelation confidence on 40 ms frames. HNR uses the accepted pitch lag. Jitter and shimmer use cycle-synchronous pitch marks from the 48 kHz waveform. Formants use pre-emphasized 25 ms frames, order-18 LPC, and spectral-envelope peaks. MFCC-13 uses a 26-band mel filterbank and orthonormal DCT-II; first and second temporal derivatives are included.\n\nLIMITATIONS\nAll results are descriptive DSP estimates, not medical measurements. Music, reverberation, clipping, overlapping speakers, and non-stationary noise can reduce accuracy. Confirm boundaries and unreliable values by listening and inspecting the plots.`;
       return { blob: new Blob([report], { type: 'text/plain;charset=utf-8' }), filename: `${basename}-report.txt` };
     }
   }
 
   function clearWorkspace() {
+    processingGenerationRef.current += 1;
+    cancelRecording();
     stopPlayback();
+    setIsBusy(false);
     setAsset(null);
     setVersions(new Map());
     setAnalysis(null);
+    setAdvancedAnalysis(null);
     setSegments([]);
+    setSegmentsEdited(false);
+    setEnergyMargin(9);
+    setVoicingThreshold(.42);
+    setAppliedThresholds({ energyMarginDb: 9, voicingPeriodicity: .42 });
+    setPlotView({ start: 0, end: 1 });
     setHistory([]);
+    setProcessingSteps([]);
     setStatus('Ready for a 48 kHz mono recording');
     setActiveSection('workspace');
   }
@@ -420,7 +665,7 @@ export default function Home() {
       <section className="main-column" id="top">
         <header className="topbar">
           <div><span className="eyebrow">Speech signal workspace</span><h1>Hear the signal. See the structure.</h1></div>
-          <div className="top-actions"><span className="mono-pill">48 kHz · MONO</span>{asset && <button className="quiet-button" onClick={clearWorkspace}>New session</button>}<button className="icon-button" onClick={() => setShowHelp(true)} aria-label="Open help">?</button></div>
+          <div className="top-actions"><span className="mono-pill">48 kHz · MONO</span>{asset && <button className="quiet-button" onClick={clearWorkspace} disabled={controlsLocked}>New session</button>}<button className="icon-button" onClick={() => setShowHelp(true)} aria-label="Open help">?</button></div>
         </header>
 
         <div className="content" id="workspace">
@@ -430,9 +675,19 @@ export default function Home() {
               <h2>{isRecording ? 'Recording your voice' : asset ? 'Signal ready to inspect' : 'Bring in a voice'}</h2>
               <p>{asset ? `${asset.name} is standardized to the assignment format and processed entirely on this device.` : 'Record the assignment passage at 48 kHz mono, or drop in an existing audio file to begin.'}</p>
               <div className="button-row">
-                {isRecording ? <button className="primary-button stop-button" onClick={stopRecording}><span className="stop-square" /> Stop · {formatTime(recordingSeconds, 1)}</button> : <button className="primary-button" id="start-recording" onClick={startRecording} disabled={isBusy}><span className="record-dot" /> Start recording</button>}
-                <label className={`secondary-button ${isBusy ? 'disabled' : ''}`}>Upload audio<input type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.webm,.flac" onChange={onFileInput} hidden disabled={isBusy} /></label>
-                {asset && <button className="secondary-button" onClick={() => void play(48000)}>{playingRate === 48000 ? '■ Stop' : '▶ Play source'}</button>}
+                {isRecording ? <button className="primary-button stop-button" onClick={() => stopRecording()}><span className="stop-square" /> Stop · {formatTime(recordingSeconds, 1)}</button> : <button className="primary-button" id="start-recording" onClick={startRecording} disabled={isBusy}><span className="record-dot" /> Start recording</button>}
+                <label
+                  className={`secondary-button ${controlsLocked ? 'disabled' : ''}`}
+                  role="button"
+                  tabIndex={controlsLocked ? -1 : 0}
+                  aria-disabled={controlsLocked}
+                  onKeyDown={(event) => {
+                    if (controlsLocked || (event.key !== 'Enter' && event.key !== ' ')) return;
+                    event.preventDefault();
+                    fileInputRef.current?.click();
+                  }}
+                >Upload audio<input ref={fileInputRef} type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.webm,.flac" onChange={onFileInput} hidden disabled={controlsLocked} /></label>
+                {asset && <button className="secondary-button" onClick={() => void play(48000)} disabled={controlsLocked}>{playingRate === 48000 ? '■ Stop' : '▶ Play source'}</button>}
               </div>
               {microphoneSupported === false && <p className="microphone-note">Microphone capture is unavailable in this preview browser. Open the local URL in Chrome/Edge or use Upload audio.</p>}
               <details className="script-panel"><summary>Assignment recording script</summary><p>{ASSIGNMENT_TEXT}</p></details>
@@ -459,15 +714,22 @@ export default function Home() {
                 <div><span className="step-label">02 / COMPARE</span><h2>Downsampling lab</h2><p>Listen for bandwidth loss while sample count and PCM size fall.</p></div>
                 <span className="method-chip">Anti-alias resampling</span>
               </div>
-              <div className="rate-grid">
+              <div className="rate-grid" role="radiogroup" aria-label="Downsampled signal version">
                 {TARGET_RATES.map((rate) => {
                   const samples = versions.get(rate)!;
-                  return <article className={`rate-card ${selectedRate === rate ? 'selected' : ''}`} key={rate} onClick={() => { setSelectedRate(rate); if (rate !== 48000 && plotMode === 'features') setPlotMode('waveform'); }}>
-                    <div className="rate-head"><div><strong>{rate / 1000} kHz</strong><span>{rate === 48000 ? 'REFERENCE' : `${rate / 2000} kHz NYQUIST`}</span></div><button onClick={(event) => { event.stopPropagation(); void play(rate); }} aria-label={`${rate / 1000} kilohertz ${playingRate === rate ? 'stop' : 'play'}`}>{playingRate === rate ? '■' : '▶'}</button></div>
+                  const selectRate = () => { if (controlsLocked) return; setSelectedRate(rate); if (rate !== 48000 && plotMode === 'features') setPlotMode('waveform'); };
+                  return <article className={`rate-card ${selectedRate === rate ? 'selected' : ''}`} key={rate} onClick={selectRate}>
+                    <div className="rate-head">
+                      <label className={`rate-choice ${controlsLocked ? 'disabled' : ''}`} onClick={(event) => event.stopPropagation()}>
+                        <input className="sr-only" type="radio" name="signal-rate" value={rate} checked={selectedRate === rate} onChange={selectRate} disabled={controlsLocked} />
+                        <span><strong>{rate / 1000} kHz</strong><span>{rate === 48000 ? 'REFERENCE' : `${rate / 2000} kHz NYQUIST`}</span></span>
+                      </label>
+                      <button className="rate-play" onClick={(event) => { event.stopPropagation(); void play(rate); }} aria-label={`${rate / 1000} kilohertz ${playingRate === rate ? 'stop' : 'play'}`} disabled={controlsLocked}>{playingRate === rate ? '■' : '▶'}</button>
+                    </div>
                     <WaveformPlot samples={samples} sampleRate={rate} compact />
                     <p><strong>{RATE_NOTES[rate].title}</strong>{RATE_NOTES[rate].note}</p>
                     <div className="rate-meta"><span>{samples.length.toLocaleString()} samples</span><span>{prettyBytes(44 + samples.length * 2)}</span></div>
-                    <DownloadAction className="download-link" stopPropagation prepare={() => ({ blob: encodeWav(samples, rate), filename: `${stem(asset.name)}-${rate / 1000}khz.wav` })}>Download WAV ↓</DownloadAction>
+                    <DownloadAction className="download-link" stopPropagation disabled={controlsLocked} prepare={() => ({ blob: encodeWav(samples, rate), filename: `${stem(asset.name)}-${rate / 1000}khz.wav` })}>Download WAV ↓</DownloadAction>
                   </article>;
                 })}
               </div>
@@ -477,14 +739,38 @@ export default function Home() {
               <div className="section-heading">
                 <div><span className="step-label">03 / ANALYZE</span><h2>Signal inspector</h2><p>Viewing the {selectedRate / 1000} kHz version · Nyquist {selectedRate / 2000} kHz</p></div>
                 <div className="tab-list" role="tablist" aria-label="Plot type">
-                  {(['waveform', 'spectrogram', 'features'] as PlotMode[]).map((mode) => <button key={mode} className={plotMode === mode ? 'active' : ''} onClick={() => setPlotMode(mode)} disabled={mode === 'features' && selectedRate !== 48000}>{mode}</button>)}
+                  {(['waveform', 'spectrogram', 'features'] as PlotMode[]).map((mode) => <button
+                    id={`signal-tab-${mode}`}
+                    key={mode}
+                    type="button"
+                    role="tab"
+                    aria-selected={plotMode === mode}
+                    aria-controls="signal-plot-panel"
+                    tabIndex={plotMode === mode ? 0 : -1}
+                    className={plotMode === mode ? 'active' : ''}
+                    onClick={() => setPlotMode(mode)}
+                    disabled={mode === 'features' && selectedRate !== 48000}
+                    onKeyDown={(event) => {
+                      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                      event.preventDefault();
+                      const modes: PlotMode[] = selectedRate === 48000 ? ['waveform', 'spectrogram', 'features'] : ['waveform', 'spectrogram'];
+                      const direction = event.key === 'ArrowRight' ? 1 : -1;
+                      const nextMode = event.key === 'Home' ? modes[0] : event.key === 'End' ? modes.at(-1)! : modes[(modes.indexOf(mode) + direction + modes.length) % modes.length];
+                      setPlotMode(nextMode);
+                      window.requestAnimationFrame(() => document.getElementById(`signal-tab-${nextMode}`)?.focus());
+                    }}
+                  >{mode}</button>)}
                 </div>
               </div>
-              <div className="plot-wrap">
-                {plotMode === 'waveform' && <WaveformPlot samples={activeSamples} sampleRate={selectedRate} segments={selectedRate === 48000 ? segments : []} />}
-                {plotMode === 'spectrogram' && <SpectrogramPlot samples={activeSamples} sampleRate={selectedRate} />}
-                {plotMode === 'features' && <FeaturePlot frames={analysis.frames} />}
-                <div className="plot-axis"><span>0.00 s</span><span>{(duration / 2).toFixed(2)} s</span><span>{duration.toFixed(2)} s</span></div>
+              <div className="plot-wrap" id="signal-plot-panel" role="tabpanel" aria-labelledby={`signal-tab-${plotMode}`}>
+                <div className="plot-stage">
+                  {plotMode === 'waveform' && <WaveformPlot samples={activeSamples} sampleRate={selectedRate} segments={selectedRate === 48000 ? segments : []} view={plotView} onViewChange={setPlotView} />}
+                  {plotMode === 'spectrogram' && <SpectrogramPlot samples={activeSamples} sampleRate={selectedRate} view={plotView} onViewChange={setPlotView} />}
+                  {plotMode === 'features' && <FeaturePlot frames={analysis.frames} view={plotView} onViewChange={setPlotView} />}
+                  <span className="plot-gesture-hint" aria-hidden="true">Drag a window to zoom · scroll to zoom</span>
+                  {(plotView.start > 0 || plotView.end < 1) && <button className="plot-reset" type="button" onClick={() => setPlotView({ start: 0, end: 1 })}>Reset view</button>}
+                </div>
+                <div className="plot-axis"><span>{(duration * plotView.start).toFixed(2)} s</span><span>{(duration * (plotView.start + plotView.end) / 2).toFixed(2)} s</span><span>{(duration * plotView.end).toFixed(2)} s</span></div>
               </div>
               {plotMode === 'features' && <div className="feature-key"><span className="energy-key" />Energy <span className="periodicity-key" />Periodicity <span className="zcr-key" />ZCR × 8</div>}
               <div className="metric-grid">
@@ -495,29 +781,125 @@ export default function Home() {
               </div>
             </section>
 
+            {advancedAnalysis && <section className="analysis-card advanced-card" aria-labelledby="advanced-title">
+              <div className="section-heading">
+                <div><span className="step-label">ADVANCED DSP</span><h2 id="advanced-title">Voice & vocal-tract analysis</h2><p>F0, HNR, formants, and MFCC use 16 kHz wideband audio; cycle perturbation tracks the 48 kHz source.</p></div>
+                <div className="advanced-heading-actions">
+                  <span className="method-chip">16 kHz analysis reference</span>
+                  <div className="tab-list advanced-tabs" role="tablist" aria-label="Advanced analysis type">
+                    {(['voice', 'formants', 'mfcc'] as AdvancedMode[]).map((mode) => <button
+                      id={`advanced-tab-${mode}`}
+                      key={mode}
+                      type="button"
+                      role="tab"
+                      aria-selected={advancedMode === mode}
+                      tabIndex={advancedMode === mode ? 0 : -1}
+                      aria-controls="advanced-panel"
+                      className={advancedMode === mode ? 'active' : ''}
+                      onClick={() => setAdvancedMode(mode)}
+                      onKeyDown={(event) => {
+                        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                        event.preventDefault();
+                        const modes: AdvancedMode[] = ['voice', 'formants', 'mfcc'];
+                        const direction = event.key === 'ArrowRight' ? 1 : -1;
+                        const nextMode = event.key === 'Home' ? modes[0] : event.key === 'End' ? modes.at(-1)! : modes[(modes.indexOf(mode) + direction + modes.length) % modes.length];
+                        setAdvancedMode(nextMode);
+                        window.requestAnimationFrame(() => document.getElementById(`advanced-tab-${nextMode}`)?.focus());
+                      }}
+                    >{mode === 'voice' ? 'Voice / F0' : mode === 'formants' ? 'LPC formants' : 'MFCC-13'}</button>)}
+                  </div>
+                </div>
+              </div>
+
+              <div id="advanced-panel" role="tabpanel" aria-labelledby={`advanced-tab-${advancedMode}`}>
+                {advancedMode === 'voice' && <>
+                  <div className="plot-wrap">
+                    <div className="plot-stage">
+                      <PitchContourPlot frames={advancedAnalysis.pitchFrames} duration={duration} view={plotView} onViewChange={setPlotView} />
+                      <span className="plot-gesture-hint" aria-hidden="true">Gaps = unvoiced or unreliable · drag to zoom</span>
+                      {(plotView.start > 0 || plotView.end < 1) && <button className="plot-reset" type="button" onClick={() => setPlotView({ start: 0, end: 1 })}>Reset view</button>}
+                    </div>
+                    <div className="plot-axis"><span>{(duration * plotView.start).toFixed(2)} s</span><span>{(duration * (plotView.start + plotView.end) / 2).toFixed(2)} s</span><span>{(duration * plotView.end).toFixed(2)} s</span></div>
+                  </div>
+                  <div className="advanced-metric-grid">
+                    <div><small>Median F0</small><strong>{metric(advancedAnalysis.voiceQuality.medianF0Hz, 'Hz')}</strong></div>
+                    <div><small>F0 range</small><strong>{advancedAnalysis.voiceQuality.minF0Hz === null || advancedAnalysis.voiceQuality.maxF0Hz === null ? 'Not reliable' : `${advancedAnalysis.voiceQuality.minF0Hz.toFixed(0)}–${advancedAnalysis.voiceQuality.maxF0Hz.toFixed(0)} Hz`}</strong></div>
+                    <div><small>Local jitter</small><strong>{metric(advancedAnalysis.voiceQuality.jitterLocalPercent, '%', 3)}</strong></div>
+                    <div><small>Local shimmer</small><strong>{metric(advancedAnalysis.voiceQuality.shimmerLocalPercent, '%', 3)}</strong></div>
+                    <div><small>Median HNR</small><strong>{metric(advancedAnalysis.voiceQuality.hnrDb, 'dB')}</strong></div>
+                    <div><small>Voiced frames</small><strong>{(advancedAnalysis.voiceQuality.voicedRatio * 100).toFixed(1)}%</strong></div>
+                  </div>
+                  <p className="analysis-caution">Jitter, shimmer, and HNR are engineering descriptors for this recording—not a medical or clinical diagnosis. “Not reliable” means too few valid voiced cycles.</p>
+                </>}
+
+                {advancedMode === 'formants' && <>
+                  <div className="plot-wrap">
+                    <div className="plot-stage">
+                      <FormantPlot frames={advancedAnalysis.formantFrames} duration={duration} view={plotView} onViewChange={setPlotView} />
+                      <span className="plot-gesture-hint" aria-hidden="true">Voiced frames only · drag to zoom</span>
+                      {(plotView.start > 0 || plotView.end < 1) && <button className="plot-reset" type="button" onClick={() => setPlotView({ start: 0, end: 1 })}>Reset view</button>}
+                    </div>
+                    <div className="plot-axis"><span>{(duration * plotView.start).toFixed(2)} s</span><span>{(duration * (plotView.start + plotView.end) / 2).toFixed(2)} s</span><span>{(duration * plotView.end).toFixed(2)} s</span></div>
+                  </div>
+                  <div className="formant-key"><span className="f1-key" />F1 <span className="f2-key" />F2 <span className="f3-key" />F3</div>
+                  <div className="advanced-metric-grid compact-metrics">
+                    <div><small>Median F1</small><strong>{metric(advancedAnalysis.formantMediansHz[0], 'Hz', 0)}</strong></div>
+                    <div><small>Median F2</small><strong>{metric(advancedAnalysis.formantMediansHz[1], 'Hz', 0)}</strong></div>
+                    <div><small>Median F3</small><strong>{metric(advancedAnalysis.formantMediansHz[2], 'Hz', 0)}</strong></div>
+                    <div><small>Valid F1/F2 frames</small><strong>{advancedAnalysis.validFormantFrames} / {advancedAnalysis.formantFrames.length}</strong></div>
+                  </div>
+                  <p className="analysis-caution">Order-18 LPC estimates resonances, not phoneme labels. Results are withheld when the spectral envelope has too few plausible peaks.</p>
+                </>}
+
+                {advancedMode === 'mfcc' && <>
+                  <div className="subcontrol-row">
+                    <p>13-coefficient cepstrogram</p>
+                    <div className="mini-tab-list" role="group" aria-label="MFCC derivative order">
+                      {([['coefficients', 'Static'], ['delta', 'Δ'], ['deltaDelta', 'Δ²']] as [MfccMode, string][]).map(([mode, label]) => <button type="button" key={mode} className={mfccMode === mode ? 'active' : ''} aria-pressed={mfccMode === mode} onClick={() => setMfccMode(mode)}>{label}</button>)}
+                    </div>
+                  </div>
+                  <div className="plot-wrap">
+                    <div className="plot-stage">
+                      <MfccPlot frames={advancedAnalysis.mfccFrames} duration={duration} mode={mfccMode} view={plotView} onViewChange={setPlotView} />
+                      <span className="plot-gesture-hint light-hint" aria-hidden="true">C0 energy → C12 fine spectral detail</span>
+                      {(plotView.start > 0 || plotView.end < 1) && <button className="plot-reset" type="button" onClick={() => setPlotView({ start: 0, end: 1 })}>Reset view</button>}
+                    </div>
+                    <div className="plot-axis"><span>{(duration * plotView.start).toFixed(2)} s</span><span>{(duration * (plotView.start + plotView.end) / 2).toFixed(2)} s</span><span>{(duration * plotView.end).toFixed(2)} s</span></div>
+                  </div>
+                  <div className="advanced-metric-grid compact-metrics">
+                    <div><small>Feature dimensions</small><strong>13 × 3</strong></div>
+                    <div><small>Stored frames</small><strong>{advancedAnalysis.mfccFrames.length}</strong></div>
+                    <div><small>Mel filters</small><strong>26 bands</strong></div>
+                    <div><small>Frame / hop</small><strong>25 / 10 ms</strong></div>
+                  </div>
+                  <p className="analysis-caution">Each coefficient is contrast-normalized only for the heatmap. Exported JSON retains the raw static, Δ, and Δ² values.</p>
+                </>}
+              </div>
+            </section>}
+
             <section className="analysis-card" id="segments">
               <div className="section-heading">
                 <div><span className="step-label">04 / SEGMENT</span><h2>Speech regions</h2><p>Automatic labels are editable. Class IDs: background 0, unvoiced 1, voiced 2.</p></div>
-                <button className="outline-button" onClick={addSegment}>＋ Add region</button>
+                <div className="segment-heading-actions">{segmentsEdited && <span className="edit-protection-chip">Edits preserved by tools</span>}<button className="outline-button" onClick={addSegment} disabled={controlsLocked}>＋ Add region</button></div>
               </div>
               <div className="segment-summary">
                 {([0, 1, 2] as SegmentClass[]).map((classId) => <div key={classId} className={`summary-${classId}`}><span>{classId}</span><div><small>{CLASS_META[classId].label}</small><strong>{classDurations[classId].toFixed(2)} s</strong></div></div>)}
               </div>
               <div className="threshold-panel">
-                <label><span>Energy above noise <strong>{energyMargin} dB</strong></span><input type="range" min="3" max="20" step="1" value={energyMargin} onChange={(event) => setEnergyMargin(Number(event.target.value))} /></label>
-                <label><span>Voicing periodicity <strong>{voicingThreshold.toFixed(2)}</strong></span><input type="range" min="0.2" max="0.8" step="0.02" value={voicingThreshold} onChange={(event) => setVoicingThreshold(Number(event.target.value))} /></label>
-                <button className="primary-button dark" onClick={rerunSegmentation} disabled={isBusy}>Run automatic segmentation</button>
+                <label><span>Energy above noise <strong>{energyMargin} dB</strong></span><input type="range" min="3" max="20" step="1" value={energyMargin} onChange={(event) => setEnergyMargin(Number(event.target.value))} disabled={controlsLocked} /></label>
+                <label><span>Voicing periodicity <strong>{voicingThreshold.toFixed(2)}</strong></span><input type="range" min="0.2" max="0.8" step="0.02" value={voicingThreshold} onChange={(event) => setVoicingThreshold(Number(event.target.value))} disabled={controlsLocked} /></label>
+                <button className="primary-button dark" onClick={rerunSegmentation} disabled={controlsLocked}>{segmentationSettingsPending ? 'Apply threshold changes' : 'Run automatic segmentation'}</button>
               </div>
               <div className="segment-table-wrap">
                 <table className="segment-table">
                   <thead><tr><th>#</th><th>Start (s)</th><th>End (s)</th><th>Class</th><th>Confidence</th><th><span className="sr-only">Actions</span></th></tr></thead>
                   <tbody>{segments.map((segment, index) => <tr key={segment.id}>
                     <td>{String(index + 1).padStart(2, '0')}</td>
-                    <td><input aria-label={`Segment ${index + 1} start`} type="number" min="0" max={duration} step="0.01" value={segment.start.toFixed(2)} onChange={(event) => updateSegment(segment.id, 'start', Number(event.target.value))} /></td>
-                    <td><input aria-label={`Segment ${index + 1} end`} type="number" min="0" max={duration} step="0.01" value={segment.end.toFixed(2)} onChange={(event) => updateSegment(segment.id, 'end', Number(event.target.value))} /></td>
-                    <td><select aria-label={`Segment ${index + 1} class`} value={segment.classId} onChange={(event) => updateSegment(segment.id, 'classId', Number(event.target.value))}><option value="0">0 · Background</option><option value="1">1 · Unvoiced</option><option value="2">2 · Voiced</option></select></td>
+                    <td><input aria-label={`Segment ${index + 1} start`} type="number" min="0" max={segment.end} step="0.01" value={segment.start.toFixed(2)} onChange={(event) => updateSegment(segment.id, 'start', Number(event.target.value))} disabled={controlsLocked} /></td>
+                    <td><input aria-label={`Segment ${index + 1} end`} type="number" min={segment.start} max={duration} step="0.01" value={segment.end.toFixed(2)} onChange={(event) => updateSegment(segment.id, 'end', Number(event.target.value))} disabled={controlsLocked} /></td>
+                    <td><select aria-label={`Segment ${index + 1} class`} value={segment.classId} onChange={(event) => updateSegment(segment.id, 'classId', Number(event.target.value))} disabled={controlsLocked}><option value="0">0 · Background</option><option value="1">1 · Unvoiced</option><option value="2">2 · Voiced</option></select></td>
                     <td><span className={`confidence confidence-${segment.classId}`}>{Math.round(segment.confidence * 100)}%</span></td>
-                    <td><button className="delete-button" aria-label={`Delete segment ${index + 1}`} onClick={() => setSegments((current) => current.filter((item) => item.id !== segment.id))}>×</button></td>
+                    <td><button className="delete-button" aria-label={`Delete segment ${index + 1}`} disabled={controlsLocked} onClick={() => { setSegmentsEdited(true); setSegments((current) => current.filter((item) => item.id !== segment.id)); }}>×</button></td>
                   </tr>)}</tbody>
                 </table>
               </div>
@@ -525,14 +907,28 @@ export default function Home() {
 
             <section className="dual-grid">
               <article className="analysis-card process-card">
-                <div><span className="step-label">TOOLS</span><h2>Quick processing</h2><p>Apply common sample-domain transforms, with one-step-at-a-time undo history.</p></div>
+                <div><span className="step-label">TOOLS</span><h2>Quick processing</h2><p>Apply common transforms with undo. Manually corrected segment times and classes are preserved.</p></div>
                 <div className="tool-grid">
-                  <button onClick={() => void applyProcessing('normalized', normalize)}><span>↥</span><strong>Normalize</strong><small>Peak to −0.18 dBFS</small></button>
-                  <button onClick={() => void applyProcessing('dc-removed', removeDc)}><span>≋</span><strong>Remove DC</strong><small>Center around zero</small></button>
-                  <button onClick={() => void applyProcessing('pre-emphasis', (samples) => preEmphasis(samples, .97))}><span>⤴</span><strong>Pre-emphasis</strong><small>y[n]=x[n]−.97x[n−1]</small></button>
-                  <button onClick={() => void applyProcessing('reversed', reverseAudio)}><span>↔</span><strong>Reverse</strong><small>Flip sample order</small></button>
+                  <button onClick={() => void applyProcessing('normalized', normalize)} disabled={controlsLocked}><span>↥</span><strong>Normalize</strong><small>Peak to −0.18 dBFS</small></button>
+                  <button onClick={() => void applyProcessing('dc-removed', removeDc)} disabled={controlsLocked}><span>≋</span><strong>Remove DC</strong><small>Center around zero</small></button>
+                  <button onClick={() => void applyProcessing('pre-emphasis', (samples) => preEmphasis(samples, .97))} disabled={controlsLocked}><span>⤴</span><strong>Pre-emphasis</strong><small>y[n]=x[n]−.97x[n−1]</small></button>
+                  <button onClick={() => void applyProcessing('reversed', reverseAudio, (items) => items.map((segment) => ({ ...segment, start: duration - segment.end, end: duration - segment.start })).sort((a, b) => a.start - b.start))} disabled={controlsLocked}><span>↔</span><strong>Reverse</strong><small>Flip audio and edited regions</small></button>
                 </div>
-                <button className="undo-button" onClick={() => void undoProcessing()} disabled={!history.length}>↶ Undo processing ({history.length})</button>
+                <div className="filter-panel">
+                  <div className="filter-head"><div><strong>Frequency shaping</strong><small>Cascaded Butterworth biquads</small></div><div className="mini-tab-list" role="group" aria-label="Filter type">
+                    {(['highpass', 'lowpass', 'bandpass'] as FilterMode[]).map((mode) => <button type="button" key={mode} className={filterMode === mode ? 'active' : ''} aria-pressed={filterMode === mode} onClick={() => setFilterMode(mode)} disabled={controlsLocked}>{mode === 'highpass' ? 'HP' : mode === 'lowpass' ? 'LP' : 'Band'}</button>)}
+                  </div></div>
+                  <div className="filter-controls">
+                    {filterMode !== 'lowpass' && <label><span>Low cutoff</span><input type="number" min="20" max="5000" step="10" value={lowCutoff} onChange={(event) => setLowCutoff(event.target.value)} disabled={controlsLocked} /><em>Hz</em></label>}
+                    {filterMode !== 'highpass' && <label><span>High cutoff</span><input type="number" min="200" max="22000" step="100" value={highCutoff} onChange={(event) => setHighCutoff(event.target.value)} disabled={controlsLocked} /><em>Hz</em></label>}
+                    <button className="filter-apply" type="button" onClick={applySelectedFilter} disabled={controlsLocked}>Apply filter</button>
+                  </div>
+                  <div className="gate-row">
+                    <label><span>Noise gate</span><input type="range" min="-70" max="-20" step="1" value={gateThreshold} onChange={(event) => setGateThreshold(Number(event.target.value))} disabled={controlsLocked} /><strong>{gateThreshold} dBFS</strong></label>
+                    <button type="button" onClick={() => void applyProcessing(`noise-gate-${Math.abs(gateThreshold)}db`, (samples) => noiseGate(samples, 48000, gateThreshold))} disabled={controlsLocked}>Apply gate</button>
+                  </div>
+                </div>
+                <button className="undo-button" onClick={() => void undoProcessing()} disabled={!history.length || controlsLocked}>↶ Undo processing ({history.length}/4)</button>
               </article>
 
               <article className="analysis-card method-card">
@@ -549,10 +945,10 @@ export default function Home() {
             <section className="export-card" id="export">
               <div><span className="step-label">05 / EXPORT</span><h2>Take the analysis with you</h2><p>Download the signal, editable labels, machine-readable features, or a ready-to-submit text report.</p></div>
               <div className="export-actions">
-                <DownloadAction prepare={() => ({ blob: encodeWav(asset.samples, 48000), filename: `${stem(asset.name)}-48khz-mono.wav` })}>WAV <span>48 kHz source</span></DownloadAction>
-                <DownloadAction prepare={() => prepareSegmentExport('csv')}>CSV <span>Timing labels</span></DownloadAction>
-                <DownloadAction prepare={() => prepareSegmentExport('json')}>JSON <span>Full analysis</span></DownloadAction>
-                <DownloadAction prepare={() => prepareSegmentExport('txt')}>TXT <span>Assignment report</span></DownloadAction>
+                <DownloadAction disabled={controlsLocked} prepare={() => ({ blob: encodeWav(asset.samples, 48000), filename: `${stem(asset.name)}-48khz-mono.wav` })}>WAV <span>48 kHz source</span></DownloadAction>
+                <DownloadAction disabled={controlsLocked} prepare={() => prepareSegmentExport('csv')}>CSV <span>Timing labels</span></DownloadAction>
+                <DownloadAction disabled={controlsLocked} prepare={() => prepareSegmentExport('json')}>JSON <span>Full analysis</span></DownloadAction>
+                <DownloadAction disabled={controlsLocked} prepare={() => prepareSegmentExport('txt')}>TXT <span>Assignment report</span></DownloadAction>
               </div>
             </section>
           </> : <section className="analysis-card empty-card" id="analysis">
