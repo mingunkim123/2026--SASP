@@ -6,7 +6,7 @@
 
 - 마이크 녹음: `48 kHz · mono` 제약을 요청하고, 녹음 완료 후 정확한 48 kHz mono PCM으로 표준화
 - 오디오 가져오기: 브라우저가 디코딩할 수 있는 WAV, MP3, M4A, AAC, OGG, WebM, FLAC 파일 지원
-- 다운샘플링: 48/16/8/2 kHz 버전을 anti-alias resampling으로 생성하고 즉시 비교 재생 및 WAV 저장
+- 다운샘플링: 48/16/8/2 kHz 버전을 anti-alias resampling으로 생성하고 즉시 비교 재생 및 WAV 저장. Web Audio가 직접 허용하지 않는 2 kHz는 windowed-sinc 변환 및 호환 재생 경로 사용
 - 신호 분석: 파형, 스펙트로그램, RMS, peak dBFS, median pitch, spectral centroid, noise floor 표시
 - 자동 분할: background(0), unvoiced(1), voiced(2) 구간 및 confidence 생성
 - 수동 교정: 각 구간의 시작/끝 시각과 class ID를 표에서 수정하거나 새 구간 추가/삭제
@@ -24,6 +24,7 @@ npm run dev
 ```
 
 브라우저에서 `http://localhost:3000`을 엽니다. 마이크 녹음은 브라우저 권한과 secure context(`localhost` 또는 HTTPS)가 필요합니다.
+내장 미리보기 브라우저에서 마이크 입력을 제공하지 않는 경우 Chrome 또는 Edge에서 같은 주소를 열거나 `Upload audio`를 사용하세요.
 
 프로덕션 빌드:
 

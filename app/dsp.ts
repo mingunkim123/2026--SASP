@@ -53,18 +53,60 @@ export function mixToMono(buffer: AudioBuffer): Float32Array {
   return mono;
 }
 
+function sinc(value: number) {
+  if (Math.abs(value) < 1e-8) return 1;
+  const phase = Math.PI * value;
+  return Math.sin(phase) / phase;
+}
+
+function windowedSincResample(samples: Float32Array, sourceRate: number, targetRate: number) {
+  const outputLength = Math.max(1, Math.round(samples.length * targetRate / sourceRate));
+  const output = new Float32Array(outputLength);
+  const cutoff = Math.min(1, targetRate / sourceRate) * 0.94;
+  const halfTaps = Math.min(256, Math.max(24, Math.ceil(12 / cutoff)));
+  const sourcePerOutput = sourceRate / targetRate;
+
+  for (let outputIndex = 0; outputIndex < outputLength; outputIndex += 1) {
+    const sourcePosition = outputIndex * sourcePerOutput;
+    const center = Math.floor(sourcePosition);
+    const first = Math.max(0, center - halfTaps + 1);
+    const last = Math.min(samples.length - 1, center + halfTaps);
+    let sum = 0;
+    let weightSum = 0;
+
+    for (let sourceIndex = first; sourceIndex <= last; sourceIndex += 1) {
+      const distance = sourcePosition - sourceIndex;
+      const window = 0.5 + 0.5 * Math.cos(Math.PI * distance / halfTaps);
+      const weight = cutoff * sinc(cutoff * distance) * window;
+      sum += samples[sourceIndex] * weight;
+      weightSum += weight;
+    }
+    output[outputIndex] = weightSum ? sum / weightSum : 0;
+  }
+  return output;
+}
+
 export async function resampleAudio(samples: Float32Array, sourceRate: number, targetRate: number) {
   if (sourceRate === targetRate) return samples.slice();
+  // Chromium rejects OfflineAudioContext sample rates below 3 kHz. The
+  // assignment needs 2 kHz, so use an explicit anti-aliasing resampler there.
+  if (sourceRate < 3000 || targetRate < 3000 || typeof OfflineAudioContext === 'undefined') {
+    return windowedSincResample(samples, sourceRate, targetRate);
+  }
   const outputLength = Math.max(1, Math.round(samples.length * targetRate / sourceRate));
-  const context = new OfflineAudioContext(1, outputLength, targetRate);
-  const buffer = context.createBuffer(1, samples.length, sourceRate);
-  buffer.getChannelData(0).set(samples);
-  const source = context.createBufferSource();
-  source.buffer = buffer;
-  source.connect(context.destination);
-  source.start();
-  const rendered = await context.startRendering();
-  return rendered.getChannelData(0).slice();
+  try {
+    const context = new OfflineAudioContext(1, outputLength, targetRate);
+    const buffer = context.createBuffer(1, samples.length, sourceRate);
+    buffer.getChannelData(0).set(samples);
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(context.destination);
+    source.start();
+    const rendered = await context.startRendering();
+    return rendered.getChannelData(0).slice();
+  } catch {
+    return windowedSincResample(samples, sourceRate, targetRate);
+  }
 }
 
 export function normalize(samples: Float32Array) {
@@ -281,13 +323,4 @@ export function formatTime(seconds: number, precision = 2) {
   const minutes = Math.floor(seconds / 60);
   const remaining = seconds - minutes * 60;
   return `${String(minutes).padStart(2, '0')}:${remaining.toFixed(precision).padStart(precision + 3, '0')}`;
-}
-
-export function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }

@@ -1,13 +1,12 @@
 'use client';
 
-import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { ChangeEvent, DragEvent, MouseEvent as ReactMouseEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AnalysisResult,
   CLASS_META,
   Segment,
   SegmentClass,
   analyzeSpeech,
-  downloadBlob,
   encodeWav,
   formatTime,
   mixToMono,
@@ -22,6 +21,7 @@ import { FeaturePlot, SpectrogramPlot, WaveformPlot } from './plots';
 const TARGET_RATES = [48000, 16000, 8000, 2000] as const;
 type TargetRate = (typeof TARGET_RATES)[number];
 type PlotMode = 'waveform' | 'spectrogram' | 'features';
+type SectionId = 'workspace' | 'record' | 'analysis' | 'segments' | 'export';
 
 type AudioAsset = {
   name: string;
@@ -40,8 +40,37 @@ const RATE_NOTES: Record<TargetRate, { title: string; note: string }> = {
   2000: { title: 'Severely limited', note: '1 kHz ceiling removes crucial intelligibility cues.' },
 };
 
+const NAV_ITEMS: { id: SectionId; icon: string; label: string }[] = [
+  { id: 'workspace', icon: '⌁', label: 'Workspace' },
+  { id: 'record', icon: '◉', label: 'Record' },
+  { id: 'analysis', icon: '⌇', label: 'Analysis' },
+  { id: 'segments', icon: '▤', label: 'Segments' },
+  { id: 'export', icon: '⇩', label: 'Export' },
+];
+
 const prettyBytes = (bytes: number) => bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 const stem = (name: string) => name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9가-힣_-]+/gi, '-');
+
+function DownloadAction({ prepare, className, children, stopPropagation = false }: { prepare: () => { blob: Blob; filename: string } | null; className?: string; children: ReactNode; stopPropagation?: boolean }) {
+  function handleClick(event: ReactMouseEvent<HTMLAnchorElement>) {
+    if (stopPropagation) event.stopPropagation();
+    const download = prepare();
+    if (!download) {
+      event.preventDefault();
+      return;
+    }
+    const anchor = event.currentTarget;
+    const previousUrl = anchor.dataset.objectUrl;
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    const url = URL.createObjectURL(download.blob);
+    anchor.href = url;
+    anchor.download = download.filename;
+    anchor.dataset.objectUrl = url;
+    window.setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+
+  return <a href="#export" className={className} download onClick={handleClick}>{children}</a>;
+}
 
 export default function Home() {
   const [asset, setAsset] = useState<AudioAsset | null>(null);
@@ -60,11 +89,14 @@ export default function Home() {
   const [status, setStatus] = useState('Ready for a 48 kHz mono recording');
   const [showHelp, setShowHelp] = useState(false);
   const [history, setHistory] = useState<AudioAsset[]>([]);
+  const [activeSection, setActiveSection] = useState<SectionId>('workspace');
+  const [microphoneSupported, setMicrophoneSupported] = useState<boolean | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const liveAnimationRef = useRef<number | null>(null);
   const playbackRef = useRef<{ context: AudioContext; source: AudioBufferSourceNode } | null>(null);
+  const manualNavigationUntilRef = useRef(0);
 
   const activeSamples = versions.get(selectedRate) ?? null;
   const duration = asset ? asset.samples.length / asset.sampleRate : 0;
@@ -81,12 +113,45 @@ export default function Home() {
     playbackRef.current?.context.close();
   }, []);
 
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      setMicrophoneSupported(Boolean(window.isSecureContext && typeof navigator.mediaDevices?.getUserMedia === 'function' && typeof MediaRecorder !== 'undefined'));
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  useEffect(() => {
+    const updateActiveSection = () => {
+      if (Date.now() < manualNavigationUntilRef.current) return;
+      let current: SectionId = window.scrollY < 80 ? 'workspace' : 'record';
+      for (const id of ['analysis', 'segments', 'export'] as SectionId[]) {
+        const element = document.getElementById(id);
+        if (element && element.getBoundingClientRect().top <= window.innerHeight * 0.32) current = id;
+      }
+      if (document.getElementById('export') && window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 32) current = 'export';
+      setActiveSection(current);
+    };
+    window.addEventListener('scroll', updateActiveSection, { passive: true });
+    updateActiveSection();
+    return () => window.removeEventListener('scroll', updateActiveSection);
+  }, [asset]);
+
   async function buildAsset(nextAsset: AudioAsset, message = 'Analysis complete') {
     setIsBusy(true);
     setStatus('Resampling and extracting speech features…');
     try {
-      const resampledPairs = await Promise.all(TARGET_RATES.map(async (rate) => [rate, await resampleAudio(nextAsset.samples, nextAsset.sampleRate, rate)] as const));
-      const nextVersions = new Map<TargetRate, Float32Array>(resampledPairs);
+      const reference = await resampleAudio(nextAsset.samples, nextAsset.sampleRate, 48000);
+      const [wideband, telephone] = await Promise.all([
+        resampleAudio(reference, 48000, 16000),
+        resampleAudio(reference, 48000, 8000),
+      ]);
+      const narrowband = await resampleAudio(telephone, 8000, 2000);
+      const nextVersions = new Map<TargetRate, Float32Array>([
+        [48000, reference],
+        [16000, wideband],
+        [8000, telephone],
+        [2000, narrowband],
+      ]);
       const nextAnalysis = analyzeSpeech(nextVersions.get(48000)!, 48000, energyMargin, voicingThreshold);
       setAsset({ ...nextAsset, samples: nextVersions.get(48000)!, sampleRate: 48000 });
       setVersions(nextVersions);
@@ -214,22 +279,33 @@ export default function Home() {
     stopPlayback();
     const samples = versions.get(rate);
     if (!samples) return;
-    const context = new AudioContext();
-    const buffer = context.createBuffer(1, samples.length, rate);
-    buffer.getChannelData(0).set(samples);
-    const source = context.createBufferSource();
-    source.buffer = buffer;
-    source.connect(context.destination);
-    source.onended = () => {
-      if (playbackRef.current?.source === source) {
-        void context.close();
-        playbackRef.current = null;
-        setPlayingRate(null);
-      }
-    };
-    playbackRef.current = { context, source };
-    setPlayingRate(rate);
-    source.start();
+    try {
+      const context = new AudioContext();
+      // Web Audio also rejects AudioBuffer rates below 3 kHz. Upsampling for
+      // playback preserves the 1 kHz-limited signal while satisfying the API.
+      const playbackRate = rate < 3000 ? 8000 : rate;
+      const playbackSamples = rate < 3000 ? await resampleAudio(samples, rate, playbackRate) : samples;
+      const buffer = context.createBuffer(1, playbackSamples.length, playbackRate);
+      buffer.getChannelData(0).set(playbackSamples);
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(context.destination);
+      source.onended = () => {
+        if (playbackRef.current?.source === source) {
+          void context.close();
+          playbackRef.current = null;
+          setPlayingRate(null);
+        }
+      };
+      playbackRef.current = { context, source };
+      setPlayingRate(rate);
+      setStatus(`Playing the ${rate / 1000} kHz version`);
+      source.start();
+    } catch (error) {
+      console.error(error);
+      setPlayingRate(null);
+      setStatus(`Could not play the ${rate / 1000} kHz version in this browser.`);
+    }
   }
 
   function rerunSegmentation() {
@@ -273,18 +349,18 @@ export default function Home() {
     setSegments((current) => [...current, { id: `manual-${Date.now()}`, start: lastEnd, end: Math.min(duration, lastEnd + .1), classId: 0, confidence: 1 }]);
   }
 
-  function exportSegments(format: 'csv' | 'json' | 'txt') {
-    if (!asset || !analysis) return;
+  function prepareSegmentExport(format: 'csv' | 'json' | 'txt') {
+    if (!asset || !analysis) return null;
     const basename = stem(asset.name);
     if (format === 'csv') {
       const body = ['start_sec,end_sec,class_id,class_label,confidence', ...segments.map((segment) => `${segment.start.toFixed(4)},${segment.end.toFixed(4)},${segment.classId},${CLASS_META[segment.classId].label},${segment.confidence.toFixed(3)}`)].join('\n');
-      downloadBlob(new Blob([body], { type: 'text/csv;charset=utf-8' }), `${basename}-segments.csv`);
+      return { blob: new Blob([body], { type: 'text/csv;charset=utf-8' }), filename: `${basename}-segments.csv` };
     } else if (format === 'json') {
-      downloadBlob(new Blob([JSON.stringify({ source: asset.name, sampleRate: 48000, channels: 1, thresholds: { energyMarginDb: energyMargin, voicingPeriodicity: voicingThreshold }, metrics: analysis, segments }, null, 2)], { type: 'application/json' }), `${basename}-analysis.json`);
+      return { blob: new Blob([JSON.stringify({ source: asset.name, sampleRate: 48000, channels: 1, thresholds: { energyMarginDb: energyMargin, voicingPeriodicity: voicingThreshold }, metrics: analysis, segments }, null, 2)], { type: 'application/json' }), filename: `${basename}-analysis.json` };
     } else {
       const rows = segments.map((segment) => `${segment.start.toFixed(3)} ~ ${segment.end.toFixed(3)} sec: ${CLASS_META[segment.classId].label} (${segment.classId})`).join('\n');
       const report = `SASP LAB — Speech Signal Analysis Report\n\nInput: ${asset.name}\nStandardized format: 48 kHz, mono\nDuration: ${duration.toFixed(3)} sec\nPeak: ${analysis.peakDbfs.toFixed(2)} dBFS\nRMS: ${analysis.meanRmsDb.toFixed(2)} dBFS\nMedian voiced pitch: ${analysis.estimatedPitchHz?.toFixed(1) ?? 'N/A'} Hz\nSpectral centroid: ${analysis.spectralCentroidHz.toFixed(1)} Hz\n\nSEGMENTATION\n${rows}\n\nAUTOMATIC SEGMENTATION METHOD\n25 ms frames and 10 ms hops are analyzed for RMS energy, zero-crossing rate, and normalized autocorrelation. A robust noise floor (20th percentile) creates an adaptive speech threshold. Frames below it are background (0); energetic, periodic frames with plausible pitch are voiced (2); remaining speech frames are unvoiced (1). A two-pass local vote suppresses isolated label flips. Thresholds remain visible and adjustable, and every result can be manually corrected before export.\n\nLIMITATIONS\nThis signal-processing baseline is explainable rather than phoneme-aware. Music, reverberation, clipping, overlapping speakers, and non-stationary noise can reduce accuracy. Confirm boundaries by listening and inspecting the spectrogram.`;
-      downloadBlob(new Blob([report], { type: 'text/plain;charset=utf-8' }), `${basename}-report.txt`);
+      return { blob: new Blob([report], { type: 'text/plain;charset=utf-8' }), filename: `${basename}-report.txt` };
     }
   }
 
@@ -296,6 +372,26 @@ export default function Home() {
     setSegments([]);
     setHistory([]);
     setStatus('Ready for a 48 kHz mono recording');
+    setActiveSection('workspace');
+  }
+
+  function navigateTo(section: SectionId) {
+    manualNavigationUntilRef.current = Date.now() + 800;
+    if (!asset && (section === 'segments' || section === 'export')) {
+      setStatus(`${section === 'segments' ? 'Segment editing' : 'Export tools'} unlocks after you record or upload audio.`);
+      setActiveSection('record');
+      document.getElementById('record')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      window.history.replaceState(null, '', '#record');
+      window.setTimeout(() => document.getElementById('start-recording')?.focus(), 350);
+      return;
+    }
+
+    const target = document.getElementById(section === 'workspace' ? 'top' : section);
+    if (!target) return;
+    setActiveSection(section);
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    window.history.replaceState(null, '', `#${section}`);
+    if (section === 'record') window.setTimeout(() => document.getElementById('start-recording')?.focus(), 350);
   }
 
   const liveBars = Array.from({ length: 90 }, (_, index) => {
@@ -307,13 +403,16 @@ export default function Home() {
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <a className="brand" href="#top" aria-label="SASP Lab home"><span className="brand-mark" aria-hidden="true">S</span><span>SASP LAB</span></a>
+        <button className="brand" type="button" onClick={() => navigateTo('workspace')} aria-label="SASP Lab home"><span className="brand-mark" aria-hidden="true">S</span><span>SASP LAB</span></button>
         <nav className="nav-list" aria-label="Main navigation">
-          <a className="nav-item active" href="#workspace"><span aria-hidden="true">⌁</span>Workspace</a>
-          <a className="nav-item" href="#record"><span aria-hidden="true">◉</span>Record</a>
-          <a className="nav-item" href="#analysis"><span aria-hidden="true">⌇</span>Analysis</a>
-          <a className="nav-item" href="#segments"><span aria-hidden="true">▤</span>Segments</a>
-          <a className="nav-item" href="#export"><span aria-hidden="true">⇩</span>Export</a>
+          {NAV_ITEMS.map((item) => <button
+            key={item.id}
+            type="button"
+            className={`nav-item ${activeSection === item.id ? 'active' : ''}`}
+            onClick={() => navigateTo(item.id)}
+            aria-current={activeSection === item.id ? 'page' : undefined}
+            title={!asset && (item.id === 'segments' || item.id === 'export') ? `${item.label} — load audio first` : item.label}
+          ><span aria-hidden="true">{item.icon}</span>{item.label}{!asset && (item.id === 'segments' || item.id === 'export') && <i className="nav-lock" aria-hidden="true">•</i>}</button>)}
         </nav>
         <div className="sidebar-note"><span className="status-dot" aria-hidden="true" /><div><strong>Local processing</strong><small>Your audio stays on this device.</small></div></div>
       </aside>
@@ -331,10 +430,11 @@ export default function Home() {
               <h2>{isRecording ? 'Recording your voice' : asset ? 'Signal ready to inspect' : 'Bring in a voice'}</h2>
               <p>{asset ? `${asset.name} is standardized to the assignment format and processed entirely on this device.` : 'Record the assignment passage at 48 kHz mono, or drop in an existing audio file to begin.'}</p>
               <div className="button-row">
-                {isRecording ? <button className="primary-button stop-button" onClick={stopRecording}><span className="stop-square" /> Stop · {formatTime(recordingSeconds, 1)}</button> : <button className="primary-button" onClick={startRecording} disabled={isBusy}><span className="record-dot" /> Start recording</button>}
+                {isRecording ? <button className="primary-button stop-button" onClick={stopRecording}><span className="stop-square" /> Stop · {formatTime(recordingSeconds, 1)}</button> : <button className="primary-button" id="start-recording" onClick={startRecording} disabled={isBusy}><span className="record-dot" /> Start recording</button>}
                 <label className={`secondary-button ${isBusy ? 'disabled' : ''}`}>Upload audio<input type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.webm,.flac" onChange={onFileInput} hidden disabled={isBusy} /></label>
                 {asset && <button className="secondary-button" onClick={() => void play(48000)}>{playingRate === 48000 ? '■ Stop' : '▶ Play source'}</button>}
               </div>
+              {microphoneSupported === false && <p className="microphone-note">Microphone capture is unavailable in this preview browser. Open the local URL in Chrome/Edge or use Upload audio.</p>}
               <details className="script-panel"><summary>Assignment recording script</summary><p>{ASSIGNMENT_TEXT}</p></details>
             </div>
             <div className="live-card" aria-label="Input monitor">
@@ -367,7 +467,7 @@ export default function Home() {
                     <WaveformPlot samples={samples} sampleRate={rate} compact />
                     <p><strong>{RATE_NOTES[rate].title}</strong>{RATE_NOTES[rate].note}</p>
                     <div className="rate-meta"><span>{samples.length.toLocaleString()} samples</span><span>{prettyBytes(44 + samples.length * 2)}</span></div>
-                    <button className="download-link" onClick={(event) => { event.stopPropagation(); downloadBlob(encodeWav(samples, rate), `${stem(asset.name)}-${rate / 1000}khz.wav`); }}>Download WAV ↓</button>
+                    <DownloadAction className="download-link" stopPropagation prepare={() => ({ blob: encodeWav(samples, rate), filename: `${stem(asset.name)}-${rate / 1000}khz.wav` })}>Download WAV ↓</DownloadAction>
                   </article>;
                 })}
               </div>
@@ -449,10 +549,10 @@ export default function Home() {
             <section className="export-card" id="export">
               <div><span className="step-label">05 / EXPORT</span><h2>Take the analysis with you</h2><p>Download the signal, editable labels, machine-readable features, or a ready-to-submit text report.</p></div>
               <div className="export-actions">
-                <button onClick={() => downloadBlob(encodeWav(asset.samples, 48000), `${stem(asset.name)}-48khz-mono.wav`)}>WAV <span>48 kHz source</span></button>
-                <button onClick={() => exportSegments('csv')}>CSV <span>Timing labels</span></button>
-                <button onClick={() => exportSegments('json')}>JSON <span>Full analysis</span></button>
-                <button onClick={() => exportSegments('txt')}>TXT <span>Assignment report</span></button>
+                <DownloadAction prepare={() => ({ blob: encodeWav(asset.samples, 48000), filename: `${stem(asset.name)}-48khz-mono.wav` })}>WAV <span>48 kHz source</span></DownloadAction>
+                <DownloadAction prepare={() => prepareSegmentExport('csv')}>CSV <span>Timing labels</span></DownloadAction>
+                <DownloadAction prepare={() => prepareSegmentExport('json')}>JSON <span>Full analysis</span></DownloadAction>
+                <DownloadAction prepare={() => prepareSegmentExport('txt')}>TXT <span>Assignment report</span></DownloadAction>
               </div>
             </section>
           </> : <section className="analysis-card empty-card" id="analysis">
